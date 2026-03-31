@@ -61,6 +61,7 @@ jobs:
         run: |
           TAG="${{ steps.release.outputs.tag }}"
           set +e
+          # Use refs/tags/ — git fetch --tags puts upstream tags here, not refs/remotes/upstream/
           git rebase "refs/tags/$TAG"
           REBASE_EXIT=$?
           set -e
