@@ -28,17 +28,22 @@ jobs:
 
       - name: Parse version from branch name
         id: version
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
         run: |
-          BRANCH="${{ github.event.inputs.branch }}"
           # Expect format: middlendian/v1.2.3
           VERSION="${BRANCH#middlendian/v}"
           if [ "$VERSION" = "$BRANCH" ]; then
             echo "::error::Branch name must match pattern 'middlendian/v*' (got: $BRANCH)"
             exit 1
           fi
+          if ! echo "$BRANCH" | grep -qE '^middlendian/v[0-9]+\.[0-9]+\.[0-9]'; then
+            echo "::error::Branch name must match pattern 'middlendian/v<semver>' (got: $BRANCH)"
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "release_tag=v${VERSION}-middlendian" >> "$GITHUB_OUTPUT"
-          echo "Branch: $BRANCH → Version: $VERSION → Release tag: v${VERSION}-middlendian"
+          echo "Branch: $BRANCH -> Version: $VERSION -> Release tag: v${VERSION}-middlendian"
 
       - name: Check release tag does not already exist
         run: |
@@ -50,16 +55,22 @@ jobs:
           echo "Tag $RELEASE_TAG does not exist — proceeding."
 
       - name: Fetch upstream remote, tags, and staging branch
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
         run: |
           git remote add upstream https://github.com/BerriAI/litellm.git
           git fetch upstream --tags
-          git fetch origin "${{ github.event.inputs.branch }}"
+          git fetch origin "$BRANCH" || {
+            echo "::error::Failed to fetch branch '$BRANCH' from origin — does it exist?"
+            exit 1
+          }
 
       - name: Verify upstream tag is ancestor of staging branch
         id: verify
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          BRANCH="${{ github.event.inputs.branch }}"
 
           # Dereference annotated tag to commit SHA
           UPSTREAM_TAG_SHA=$(git rev-parse "refs/tags/v${VERSION}^{commit}" 2>/dev/null || true)
@@ -68,7 +79,11 @@ jobs:
             exit 1
           fi
 
-          BRANCH_HEAD=$(git rev-parse "origin/${BRANCH}")
+          BRANCH_HEAD=$(git rev-parse "origin/${BRANCH}" 2>/dev/null || true)
+          if [ -z "$BRANCH_HEAD" ]; then
+            echo "::error::Could not resolve origin/${BRANCH} — branch may not exist or fetch failed"
+            exit 1
+          fi
 
           if ! git merge-base --is-ancestor "$UPSTREAM_TAG_SHA" "$BRANCH_HEAD"; then
             echo "::error::Security check failed: upstream tag v${VERSION} ($UPSTREAM_TAG_SHA) is NOT an ancestor of $BRANCH ($BRANCH_HEAD)"
@@ -78,24 +93,26 @@ jobs:
 
           echo "branch_head=$BRANCH_HEAD" >> "$GITHUB_OUTPUT"
           echo "upstream_tag_sha=$UPSTREAM_TAG_SHA" >> "$GITHUB_OUTPUT"
-          echo "✅ Verified: upstream tag v${VERSION} ($UPSTREAM_TAG_SHA) is an ancestor of $BRANCH ($BRANCH_HEAD)"
+          echo "[OK] Verified: upstream tag v${VERSION} ($UPSTREAM_TAG_SHA) is an ancestor of $BRANCH ($BRANCH_HEAD)"
 
       - name: Force-push middlendian/custom to staging branch HEAD
         run: |
           BRANCH_HEAD="${{ steps.verify.outputs.branch_head }}"
           git push --force origin "${BRANCH_HEAD}:refs/heads/middlendian/custom"
-          echo "✅ middlendian/custom updated to $BRANCH_HEAD"
+          echo "[OK] middlendian/custom updated to $BRANCH_HEAD"
 
       - name: Create and push release tag
+        env:
+          BRANCH: ${{ github.event.inputs.branch }}
         run: |
           RELEASE_TAG="${{ steps.version.outputs.release_tag }}"
           BRANCH_HEAD="${{ steps.verify.outputs.branch_head }}"
           git tag "$RELEASE_TAG" "$BRANCH_HEAD"
           git push origin "$RELEASE_TAG"
-          echo "✅ Tag $RELEASE_TAG created and pushed → Docker publish workflow triggered"
+          echo "[OK] Tag $RELEASE_TAG created and pushed -> Docker publish workflow triggered"
           echo ""
           echo "Release summary:"
-          echo "  Branch:        ${{ github.event.inputs.branch }}"
+          echo "  Branch:        $BRANCH"
           echo "  Branch HEAD:   $BRANCH_HEAD"
           echo "  Upstream tag:  ${{ steps.verify.outputs.upstream_tag_sha }}"
           echo "  Release tag:   $RELEASE_TAG"
