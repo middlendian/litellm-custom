@@ -1,0 +1,101 @@
+name: Middlendian — Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Staging branch to release (e.g. middlendian/v1.82.6)"
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Parse version from branch name
+        id: version
+        run: |
+          BRANCH="${{ github.event.inputs.branch }}"
+          # Expect format: middlendian/v1.2.3
+          VERSION="${BRANCH#middlendian/v}"
+          if [ "$VERSION" = "$BRANCH" ]; then
+            echo "::error::Branch name must match pattern 'middlendian/v*' (got: $BRANCH)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v${VERSION}-middlendian" >> "$GITHUB_OUTPUT"
+          echo "Branch: $BRANCH → Version: $VERSION → Release tag: v${VERSION}-middlendian"
+
+      - name: Check release tag does not already exist
+        run: |
+          RELEASE_TAG="${{ steps.version.outputs.release_tag }}"
+          if git ls-remote --exit-code origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "::error::Tag $RELEASE_TAG already exists on origin. Cannot re-release."
+            exit 1
+          fi
+          echo "Tag $RELEASE_TAG does not exist — proceeding."
+
+      - name: Fetch upstream remote, tags, and staging branch
+        run: |
+          git remote add upstream https://github.com/BerriAI/litellm.git
+          git fetch upstream --tags
+          git fetch origin "${{ github.event.inputs.branch }}"
+
+      - name: Verify upstream tag is ancestor of staging branch
+        id: verify
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BRANCH="${{ github.event.inputs.branch }}"
+
+          # Dereference annotated tag to commit SHA
+          UPSTREAM_TAG_SHA=$(git rev-parse "refs/tags/v${VERSION}^{commit}" 2>/dev/null || true)
+          if [ -z "$UPSTREAM_TAG_SHA" ]; then
+            echo "::error::Upstream tag v${VERSION} not found after fetching upstream"
+            exit 1
+          fi
+
+          BRANCH_HEAD=$(git rev-parse "origin/${BRANCH}")
+
+          if ! git merge-base --is-ancestor "$UPSTREAM_TAG_SHA" "$BRANCH_HEAD"; then
+            echo "::error::Security check failed: upstream tag v${VERSION} ($UPSTREAM_TAG_SHA) is NOT an ancestor of $BRANCH ($BRANCH_HEAD)"
+            echo "::error::The branch may not have been rebased onto this tag, or the upstream tag was mutated."
+            exit 1
+          fi
+
+          echo "branch_head=$BRANCH_HEAD" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag_sha=$UPSTREAM_TAG_SHA" >> "$GITHUB_OUTPUT"
+          echo "✅ Verified: upstream tag v${VERSION} ($UPSTREAM_TAG_SHA) is an ancestor of $BRANCH ($BRANCH_HEAD)"
+
+      - name: Force-push middlendian/custom to staging branch HEAD
+        run: |
+          BRANCH_HEAD="${{ steps.verify.outputs.branch_head }}"
+          git push --force origin "${BRANCH_HEAD}:refs/heads/middlendian/custom"
+          echo "✅ middlendian/custom updated to $BRANCH_HEAD"
+
+      - name: Create and push release tag
+        run: |
+          RELEASE_TAG="${{ steps.version.outputs.release_tag }}"
+          BRANCH_HEAD="${{ steps.verify.outputs.branch_head }}"
+          git tag "$RELEASE_TAG" "$BRANCH_HEAD"
+          git push origin "$RELEASE_TAG"
+          echo "✅ Tag $RELEASE_TAG created and pushed → Docker publish workflow triggered"
+          echo ""
+          echo "Release summary:"
+          echo "  Branch:        ${{ github.event.inputs.branch }}"
+          echo "  Branch HEAD:   $BRANCH_HEAD"
+          echo "  Upstream tag:  ${{ steps.verify.outputs.upstream_tag_sha }}"
+          echo "  Release tag:   $RELEASE_TAG"
