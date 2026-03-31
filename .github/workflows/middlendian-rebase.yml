@@ -1,0 +1,117 @@
+name: Middlendian — Rebase onto upstream release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Fetch upstream remote and tags
+        run: |
+          git remote add upstream https://github.com/BerriAI/litellm.git
+          git fetch upstream --tags
+
+      - name: Get latest upstream release
+        id: release
+        run: |
+          RESPONSE=$(curl -sf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/BerriAI/litellm/releases/latest)
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.tag_name')
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+            echo "::error::Failed to fetch latest upstream release tag"
+            exit 1
+          fi
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $TAG_NAME"
+
+      - name: Check branch does not already exist
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          if git ls-remote --exit-code origin "refs/heads/middlendian/$TAG" > /dev/null 2>&1; then
+            echo "::error::Branch middlendian/$TAG already exists on origin. Delete it first if you need to re-run."
+            exit 1
+          fi
+          echo "Branch middlendian/$TAG does not yet exist — proceeding."
+
+      - name: Create staging branch from middlendian/custom
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          git fetch origin middlendian/custom
+          git checkout -b "middlendian/$TAG" "origin/middlendian/custom"
+
+      - name: Attempt rebase onto upstream tag
+        id: rebase
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          set +e
+          git rebase "refs/tags/$TAG"
+          REBASE_EXIT=$?
+          set -e
+
+          if [ $REBASE_EXIT -eq 0 ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            # Capture conflict info BEFORE aborting (state is lost after abort)
+            CONFLICTING=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            STOPPED_SHA=$(cat .git/rebase-merge/stopped-sha 2>/dev/null || echo "unknown")
+            STOPPED_MSG=$(git log --format="%s" -1 "$STOPPED_SHA" 2>/dev/null || echo "unknown")
+
+            echo "conflicting_files=$CONFLICTING" >> "$GITHUB_OUTPUT"
+            echo "stopped_sha=$STOPPED_SHA" >> "$GITHUB_OUTPUT"
+            # Escape newlines/special chars for GITHUB_OUTPUT
+            echo "stopped_msg=$(echo "$STOPPED_MSG" | head -1)" >> "$GITHUB_OUTPUT"
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+
+            git rebase --abort
+          fi
+
+      - name: Push branch — success
+        if: steps.rebase.outputs.result == 'success'
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          git push --force origin "middlendian/$TAG"
+          echo "✅ Rebase succeeded. Branch middlendian/$TAG is ready."
+          echo "   Upstream tag:  $TAG"
+          echo "   Branch HEAD:   $(git rev-parse HEAD)"
+
+      - name: Push clean branch and report conflicts — conflict
+        if: steps.rebase.outputs.result == 'conflict'
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          # Push at middlendian/custom HEAD — gives you a local starting point
+          git push origin "middlendian/$TAG"
+          echo ""
+          echo "❌ Rebase conflict. Branch middlendian/$TAG pushed at middlendian/custom HEAD."
+          echo ""
+          echo "Conflicting files:"
+          echo "  ${{ steps.rebase.outputs.conflicting_files }}"
+          echo ""
+          echo "Stopped at commit: ${{ steps.rebase.outputs.stopped_sha }}"
+          echo "Commit message:    ${{ steps.rebase.outputs.stopped_msg }}"
+          echo ""
+          echo "To reproduce and resolve locally:"
+          echo "  git fetch origin"
+          echo "  git remote add upstream https://github.com/BerriAI/litellm.git  # skip if already set"
+          echo "  git fetch upstream --tags"
+          echo "  git checkout middlendian/$TAG"
+          echo "  git rebase refs/tags/$TAG"
+          echo "  # for each conflict: resolve, then 'git rebase --continue'"
+          echo "  # when fully resolved: git push --force origin middlendian/$TAG"
+          exit 1
